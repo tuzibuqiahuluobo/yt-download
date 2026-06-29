@@ -1,4 +1,5 @@
 import ctypes
+import datetime as dt
 import glob
 import os
 import re
@@ -15,6 +16,7 @@ import customtkinter as ctk
 APP_VERSION = "1.1"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
+YTDLP_MAX_AGE_DAYS = 90
 YTDLP_DOWNLOAD_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 )
@@ -247,6 +249,17 @@ class YtDownloaderApp(ctk.CTk):
             messagebox.showinfo("正在更新", "yt-dlp 正在更新，请稍后再开始下载。")
             return
 
+        outdated, version_text = self.is_yt_dlp_outdated()
+        if outdated:
+            msg = (
+                f"当前 yt-dlp 版本 {version_text} 已超过 {YTDLP_MAX_AGE_DAYS} 天，"
+                "请先点击“更新组件”。"
+            )
+            self.progress_label.configure(text="ERROR: 请先更新组件", text_color="#e74c3c")
+            self.log_write(f">> {msg}\n")
+            messagebox.showwarning("组件过期", msg)
+            return
+
         self.is_user_stopping = False
         self.toggle_buttons("downloading")
         self.log_write(f">> 正在解析链接: {url}\n")
@@ -296,8 +309,26 @@ class YtDownloaderApp(ctk.CTk):
                 if self.is_user_stopping:
                     break
                 self.after(0, self.log_write, line)
-                self.handle_download_line(line)
+                if self.handle_download_line(line):
+                    self.is_user_stopping = True
+                    self.force_kill_process()
+                    self.after(
+                        0,
+                        self.on_finish,
+                        "ERROR: 组件过期，请先更新组件",
+                        "#e74c3c",
+                    )
+                    self.after(
+                        0,
+                        lambda: messagebox.showwarning(
+                            "组件过期",
+                            "当前 yt-dlp 组件已过期，请先点击“更新组件”后再下载。",
+                        ),
+                    )
+                    return
 
+            if not self.process:
+                return
             self.process.wait()
             return_code = self.process.returncode
             self.process = None
@@ -322,6 +353,10 @@ class YtDownloaderApp(ctk.CTk):
             self.after(0, self.update_ui_progress, float(match.group(1)))
 
         lowered = line.lower()
+        if "older than 90 days" in lowered:
+            self.after(0, self.log_write, ">> 组件已过期，任务已终止，请先更新组件。\n")
+            return True
+
         if "merging formats" in lowered or "merging" in lowered:
             self.after(
                 0,
@@ -336,6 +371,7 @@ class YtDownloaderApp(ctk.CTk):
                 self.log_write,
                 ">> 检测到组件可能过期，建议点击“更新组件”后重试。\n",
             )
+        return False
 
     def pause_task(self):
         self.is_user_stopping = True
@@ -409,6 +445,21 @@ class YtDownloaderApp(ctk.CTk):
             self.progress_bar.set(val / 100)
             self.progress_label.configure(text=f"DOWNLOADING: {val:.1f}%", text_color="#3498db")
 
+    def update_component_progress(self, downloaded, total):
+        if total > 0:
+            percent = min(downloaded / total * 100, 100)
+            self.progress_bar.set(percent / 100)
+            self.progress_label.configure(
+                text=f"UPDATING: {percent:.1f}%",
+                text_color="#f1c40f",
+            )
+        else:
+            downloaded_mb = downloaded / 1024 / 1024
+            self.progress_label.configure(
+                text=f"UPDATING: {downloaded_mb:.1f} MB",
+                text_color="#f1c40f",
+            )
+
     def on_finish(self, msg, color):
         self.toggle_buttons("idle")
         self.progress_label.configure(text=msg, text_color=color)
@@ -430,9 +481,15 @@ class YtDownloaderApp(ctk.CTk):
             self.after(0, self.log_write, f">> 未找到 {YTDLP_EXE_NAME}，请点击“更新组件”。\n")
             return
 
-        version = self.run_command([yt_dlp_exe, "--version"], timeout=15)
-        if version.returncode == 0 and version.output.strip():
-            self.after(0, self.log_write, f">> yt-dlp 当前版本: {version.output.strip()}\n")
+        version_text = self.get_yt_dlp_version(yt_dlp_exe)
+        if version_text:
+            self.after(0, self.log_write, f">> yt-dlp 当前版本: {version_text}\n")
+            if self.is_version_text_outdated(version_text):
+                self.after(
+                    0,
+                    self.log_write,
+                    f">> yt-dlp 已超过 {YTDLP_MAX_AGE_DAYS} 天，下载前需要先更新组件。\n",
+                )
         else:
             self.after(0, self.log_write, ">> yt-dlp 版本读取失败，建议更新组件。\n")
 
@@ -450,14 +507,8 @@ class YtDownloaderApp(ctk.CTk):
 
         try:
             yt_dlp_exe = self.prepare_writable_yt_dlp()
-            result = self.run_command([yt_dlp_exe, "-U"], timeout=180)
-            self.after(0, self.log_write, result.output)
-            if result.returncode == 0:
-                self.finish_update_success(yt_dlp_exe)
-            else:
-                self.after(0, self.log_write, ">> yt-dlp 自更新失败，尝试从 GitHub 直链下载最新版...\n")
-                self.download_latest_yt_dlp(yt_dlp_exe)
-                self.finish_update_success(yt_dlp_exe)
+            self.download_latest_yt_dlp(yt_dlp_exe)
+            self.finish_update_success(yt_dlp_exe)
         except Exception as e:
             self.after(0, self.log_write, f">> 更新失败: {e}\n")
             self.after(
@@ -472,8 +523,8 @@ class YtDownloaderApp(ctk.CTk):
             self.after(0, self.toggle_buttons, "idle")
 
     def finish_update_success(self, yt_dlp_exe):
-        version = self.run_command([yt_dlp_exe, "--version"], timeout=15)
-        version_text = version.output.strip() if version.returncode == 0 else "未知版本"
+        version_text = self.get_yt_dlp_version(yt_dlp_exe) or "未知版本"
+        self.after(0, self.progress_bar.set, 1)
         self.after(0, self.log_write, f">> yt-dlp 更新完成，当前版本: {version_text}\n")
         self.after(
             0,
@@ -494,15 +545,24 @@ class YtDownloaderApp(ctk.CTk):
         )
 
         self.after(0, self.log_write, f">> 下载地址: {YTDLP_DOWNLOAD_URL}\n")
+        self.after(0, self.progress_bar.set, 0)
         with urllib.request.urlopen(request, timeout=180) as response:
+            total = self.get_response_length(response)
+            downloaded = 0
             with open(temp_path, "wb") as temp_file:
-                shutil.copyfileobj(response, temp_file)
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                    self.after(0, self.update_component_progress, downloaded, total)
 
         if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024 * 1024:
             raise RuntimeError("下载到的 yt-dlp.exe 文件异常。")
 
-        version = self.run_command([temp_path, "--version"], timeout=15)
-        if version.returncode != 0 or not version.output.strip():
+        version_text = self.get_yt_dlp_version(temp_path)
+        if not version_text:
             try:
                 os.remove(temp_path)
             except OSError:
@@ -510,6 +570,38 @@ class YtDownloaderApp(ctk.CTk):
             raise RuntimeError("新版 yt-dlp.exe 验证失败，已保留原组件。")
 
         os.replace(temp_path, target_path)
+
+    def get_response_length(self, response):
+        try:
+            return int(response.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            return 0
+
+    def get_yt_dlp_version(self, yt_dlp_exe):
+        version = self.run_command([yt_dlp_exe, "--version"], timeout=15)
+        if version.returncode == 0 and version.output.strip():
+            return version.output.strip().splitlines()[-1].strip()
+        return ""
+
+    def is_yt_dlp_outdated(self):
+        yt_dlp_exe = self.get_yt_dlp_path()
+        if not os.path.exists(yt_dlp_exe):
+            return True, "未安装"
+        version_text = self.get_yt_dlp_version(yt_dlp_exe)
+        if not version_text:
+            return True, "未知"
+        return self.is_version_text_outdated(version_text), version_text
+
+    def is_version_text_outdated(self, version_text):
+        match = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", version_text)
+        if not match:
+            return False
+        year, month, day = map(int, match.groups())
+        try:
+            version_date = dt.date(year, month, day)
+        except ValueError:
+            return False
+        return (dt.date.today() - version_date).days > YTDLP_MAX_AGE_DAYS
 
     def prepare_writable_yt_dlp(self):
         writable_path = os.path.join(self.app_path, YTDLP_EXE_NAME)

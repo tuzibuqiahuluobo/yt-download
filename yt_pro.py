@@ -17,6 +17,7 @@ APP_VERSION = "1.1"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90
+YTDLP_LATEST_RELEASE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest"
 YTDLP_DOWNLOAD_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 )
@@ -499,18 +500,39 @@ class YtDownloaderApp(ctk.CTk):
         self.after(
             0,
             lambda: self.progress_label.configure(
-                text="STATUS: 正在更新 yt-dlp...",
+                text="STATUS: 正在检查组件版本...",
                 text_color="#f1c40f",
             ),
         )
-        self.after(0, self.log_write, ">> 开始更新 yt-dlp，请保持网络连接...\n")
+        self.after(0, self.progress_bar.set, 0)
+        self.after(0, self.log_write, ">> 正在检查 yt-dlp 最新版本...\n")
 
         try:
             yt_dlp_exe = self.prepare_writable_yt_dlp()
+            local_version = self.get_yt_dlp_version(yt_dlp_exe)
+            latest_version = self.get_latest_yt_dlp_version()
+
+            if local_version:
+                self.after(0, self.log_write, f">> 本地版本: {local_version}\n")
+            self.after(0, self.log_write, f">> 最新版本: {latest_version}\n")
+
+            if local_version and self.same_version(local_version, latest_version):
+                self.finish_update_current(latest_version)
+                return
+
+            self.after(
+                0,
+                lambda: self.progress_label.configure(
+                    text="STATUS: 正在下载新版组件...",
+                    text_color="#f1c40f",
+                ),
+            )
+            self.after(0, self.log_write, ">> 发现新版组件，开始下载...\n")
             self.download_latest_yt_dlp(yt_dlp_exe)
             self.finish_update_success(yt_dlp_exe)
         except Exception as e:
-            self.after(0, self.log_write, f">> 更新失败: {e}\n")
+            error_text = str(e) or "未知错误"
+            self.after(0, self.log_write, f">> 更新失败: {error_text}\n")
             self.after(
                 0,
                 lambda: self.progress_label.configure(
@@ -518,9 +540,34 @@ class YtDownloaderApp(ctk.CTk):
                     text_color="#e74c3c",
                 ),
             )
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "组件更新失败",
+                    f"yt-dlp 组件更新失败：\n{error_text}",
+                ),
+            )
         finally:
             self.is_updating = False
             self.after(0, self.toggle_buttons, "idle")
+
+    def finish_update_current(self, version_text):
+        self.after(0, self.progress_bar.set, 1)
+        self.after(0, self.log_write, ">> yt-dlp 已是最新版本，无需更新。\n")
+        self.after(
+            0,
+            lambda: self.progress_label.configure(
+                text="SUCCESS: 已是最新版本",
+                text_color="#2ecc71",
+            ),
+        )
+        self.after(
+            0,
+            lambda: messagebox.showinfo(
+                "无需更新",
+                f"yt-dlp 已是最新版本：{version_text}",
+            ),
+        )
 
     def finish_update_success(self, yt_dlp_exe):
         version_text = self.get_yt_dlp_version(yt_dlp_exe) or "未知版本"
@@ -570,6 +617,25 @@ class YtDownloaderApp(ctk.CTk):
             raise RuntimeError("新版 yt-dlp.exe 验证失败，已保留原组件。")
 
         os.replace(temp_path, target_path)
+
+    def get_latest_yt_dlp_version(self):
+        request = urllib.request.Request(
+            YTDLP_LATEST_RELEASE_URL,
+            headers={"User-Agent": f"YouTube-Downloader/{APP_VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                final_url = response.geturl()
+        except Exception as e:
+            raise RuntimeError(f"无法获取 yt-dlp 最新版本信息：{e}") from e
+
+        match = re.search(r"/releases/tag/([^/?#]+)", final_url)
+        if not match:
+            raise RuntimeError("无法解析 yt-dlp 最新版本号。")
+        return match.group(1).lstrip("v")
+
+    def same_version(self, local_version, latest_version):
+        return local_version.strip().lstrip("v") == latest_version.strip().lstrip("v")
 
     def get_response_length(self, response):
         try:

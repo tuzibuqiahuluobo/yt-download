@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.request
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -14,6 +15,9 @@ import customtkinter as ctk
 APP_VERSION = "1.1"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
+YTDLP_DOWNLOAD_URL = (
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+)
 
 
 def configure_process_encoding():
@@ -449,23 +453,11 @@ class YtDownloaderApp(ctk.CTk):
             result = self.run_command([yt_dlp_exe, "-U"], timeout=180)
             self.after(0, self.log_write, result.output)
             if result.returncode == 0:
-                self.after(0, self.log_write, ">> yt-dlp 更新完成。\n")
-                self.after(
-                    0,
-                    lambda: self.progress_label.configure(
-                        text="SUCCESS: 组件已更新",
-                        text_color="#2ecc71",
-                    ),
-                )
+                self.finish_update_success(yt_dlp_exe)
             else:
-                self.after(0, self.log_write, ">> yt-dlp 自动更新失败，可检查网络后重试。\n")
-                self.after(
-                    0,
-                    lambda: self.progress_label.configure(
-                        text="ERROR: 组件更新失败",
-                        text_color="#e74c3c",
-                    ),
-                )
+                self.after(0, self.log_write, ">> yt-dlp 自更新失败，尝试从 GitHub 直链下载最新版...\n")
+                self.download_latest_yt_dlp(yt_dlp_exe)
+                self.finish_update_success(yt_dlp_exe)
         except Exception as e:
             self.after(0, self.log_write, f">> 更新失败: {e}\n")
             self.after(
@@ -478,6 +470,46 @@ class YtDownloaderApp(ctk.CTk):
         finally:
             self.is_updating = False
             self.after(0, self.toggle_buttons, "idle")
+
+    def finish_update_success(self, yt_dlp_exe):
+        version = self.run_command([yt_dlp_exe, "--version"], timeout=15)
+        version_text = version.output.strip() if version.returncode == 0 else "未知版本"
+        self.after(0, self.log_write, f">> yt-dlp 更新完成，当前版本: {version_text}\n")
+        self.after(
+            0,
+            lambda: self.progress_label.configure(
+                text="SUCCESS: 组件已更新",
+                text_color="#2ecc71",
+            ),
+        )
+
+    def download_latest_yt_dlp(self, target_path):
+        temp_path = target_path + ".download.exe"
+        request = urllib.request.Request(
+            YTDLP_DOWNLOAD_URL,
+            headers={
+                "User-Agent": f"YouTube-Downloader/{APP_VERSION}",
+                "Accept": "application/octet-stream",
+            },
+        )
+
+        self.after(0, self.log_write, f">> 下载地址: {YTDLP_DOWNLOAD_URL}\n")
+        with urllib.request.urlopen(request, timeout=180) as response:
+            with open(temp_path, "wb") as temp_file:
+                shutil.copyfileobj(response, temp_file)
+
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024 * 1024:
+            raise RuntimeError("下载到的 yt-dlp.exe 文件异常。")
+
+        version = self.run_command([temp_path, "--version"], timeout=15)
+        if version.returncode != 0 or not version.output.strip():
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise RuntimeError("新版 yt-dlp.exe 验证失败，已保留原组件。")
+
+        os.replace(temp_path, target_path)
 
     def prepare_writable_yt_dlp(self):
         writable_path = os.path.join(self.app_path, YTDLP_EXE_NAME)

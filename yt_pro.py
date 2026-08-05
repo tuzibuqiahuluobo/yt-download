@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90
@@ -48,7 +48,7 @@ class YtDownloaderApp(ctk.CTk):
 
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "Youtube Downloader 1.0"
+                f"Youtube Downloader {APP_VERSION}"
             )
         except Exception:
             pass

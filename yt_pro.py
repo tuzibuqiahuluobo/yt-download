@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.2.2"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90

@@ -1,7 +1,6 @@
 import ctypes
 import datetime as dt
 import glob
-import json
 import os
 import re
 import shutil
@@ -9,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 import urllib.request
 import winreg
 from tkinter import filedialog, messagebox
@@ -17,13 +15,13 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90
 YOUTUBE_LOGIN_URL = (
     "https://accounts.google.com/ServiceLogin?service=youtube&continue="
-    "https%3A%2F%2Fwww.youtube.com%2Frobots.txt"
+    "https%3A%2F%2Fwww.youtube.com%2Ffeed%2Fsubscriptions"
 )
 YTDLP_LATEST_RELEASE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest"
 YTDLP_DOWNLOAD_URL = (
@@ -97,7 +95,7 @@ def get_browser_executable(browser):
 
 def get_login_profile(browser):
     base = os.environ.get("LOCALAPPDATA", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "YouTubeDownloader", f"{browser}-login")
+    return os.path.join(base, "YouTubeDownloader", f"{browser}-login-v2")
 
 
 def get_cookie_args(cookie_source):
@@ -106,96 +104,99 @@ def get_cookie_args(cookie_source):
     return []
 
 
-def get_devtools_pages(profile):
-    port_file = os.path.join(profile, "DevToolsActivePort")
+def get_process_path(process_id):
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    handle = kernel32.OpenProcess(0x1000, False, process_id)
+    if not handle:
+        return ""
     try:
-        with open(port_file, encoding="utf-8") as file:
-            port = int(file.readline().strip())
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=1) as response:
-            return port, json.load(response)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return 0, []
+        path = ctypes.create_unicode_buffer(32768)
+        length = ctypes.c_ulong(len(path))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
+            return path.value
+    finally:
+        kernel32.CloseHandle(handle)
+    return ""
 
 
-def find_completed_login_page(pages):
-    for page in pages:
-        url = urllib.parse.urlsplit(str(page.get("url", "")))
-        if (
-            url.scheme == "https"
-            and url.hostname in {"youtube.com", "www.youtube.com"}
-            and url.path == "/robots.txt"
-        ):
-            return page
-    return None
-
-
-def close_devtools_pages(port, pages):
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    closed = False
-    for page in pages:
-        if page.get("type") != "page" or not page.get("id"):
-            continue
-        target_id = urllib.parse.quote(str(page["id"]), safe="")
-        try:
-            with opener.open(
-                f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=2
-            ):
-                closed = True
-        except OSError:
-            pass
-    return closed
-
-
-def close_process_windows(process_id):
-    wm_close = 0x0010
-    target_pid = ctypes.c_ulong()
+def get_browser_window_handles(executable):
+    target = os.path.normcase(os.path.abspath(executable))
+    handles = set()
+    process_id = ctypes.c_ulong()
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    user32.EnumWindows.argtypes = [callback_type, ctypes.c_void_p]
 
     @callback_type
-    def close_window(window_handle, _):
-        ctypes.windll.user32.GetWindowThreadProcessId(
-            window_handle, ctypes.byref(target_pid)
-        )
-        if target_pid.value == process_id and ctypes.windll.user32.IsWindowVisible(
-            window_handle
-        ):
-            ctypes.windll.user32.PostMessageW(window_handle, wm_close, 0, 0)
+    def collect_window(window_handle, _):
+        if user32.IsWindowVisible(window_handle):
+            user32.GetWindowThreadProcessId(window_handle, ctypes.byref(process_id))
+            path = get_process_path(process_id.value)
+            if path and os.path.normcase(os.path.abspath(path)) == target:
+                handles.add(int(window_handle))
         return True
 
-    ctypes.windll.user32.EnumWindows(close_window, 0)
+    user32.EnumWindows(collect_window, 0)
+    return handles
 
 
-def wait_for_youtube_login(process, profile):
+def get_window_title(window_handle):
+    user32 = ctypes.windll.user32
+    user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+    user32.GetWindowTextW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    ]
+    length = user32.GetWindowTextLengthW(window_handle)
+    title = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(window_handle, title, len(title))
+    return title.value
+
+
+def is_completed_login_title(title):
+    lowered = title.strip().lower()
+    return " - youtube" in lowered
+
+
+def wait_for_youtube_login(executable, previous_windows):
     startup_deadline = time.monotonic() + 15
-    browser_seen = False
-    disconnected_since = None
+    login_window = 0
+    while time.monotonic() < startup_deadline:
+        new_windows = get_browser_window_handles(executable) - previous_windows
+        if new_windows:
+            login_window = next(iter(new_windows))
+            break
+        time.sleep(0.25)
 
-    while True:
-        port, pages = get_devtools_pages(profile)
-        now = time.monotonic()
-        if port:
-            browser_seen = True
-            disconnected_since = None
-        elif browser_seen:
-            disconnected_since = disconnected_since or now
-            if now - disconnected_since >= 3:
-                return False
-        elif now >= startup_deadline:
-            return False
-
-        if find_completed_login_page(pages):
-            close_devtools_pages(port, pages)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                close_process_windows(process.pid)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    return False
-            return True
+    while login_window and ctypes.windll.user32.IsWindow(login_window):
+        if is_completed_login_title(get_window_title(login_window)):
+            ctypes.windll.user32.PostMessageW(login_window, 0x0010, 0, 0)
+            close_deadline = time.monotonic() + 10
+            while (
+                ctypes.windll.user32.IsWindow(login_window)
+                and time.monotonic() < close_deadline
+            ):
+                time.sleep(0.25)
+            return not ctypes.windll.user32.IsWindow(login_window)
         time.sleep(0.5)
+    return False
 
 
 def get_windows_proxy_url():
@@ -473,15 +474,10 @@ class YtDownloaderApp(ctk.CTk):
         self.cookie_browser = ""
         self.is_logging_in = True
         self.login_btn.configure(state="disabled", text="等待登录完成...")
-        auto_close_text = (
-            "登录成功后窗口会自动关闭，请勿提前关闭。"
-            if browser != "firefox"
-            else "Firefox 登录后请手动关闭窗口。"
-        )
         messagebox.showinfo(
             "YouTube 登录",
             "即将打开一个独立的浏览器登录窗口。\n\n"
-            f"请完成 YouTube 登录和年龄验证。{auto_close_text}",
+            "请完成 YouTube 登录和年龄验证。登录成功后窗口会自动关闭，请勿提前关闭。",
         )
         threading.Thread(
             target=self.run_login_browser,
@@ -490,14 +486,17 @@ class YtDownloaderApp(ctk.CTk):
         ).start()
 
     def run_login_browser(self, browser, executable, profile):
+        previous_windows = get_browser_window_handles(executable)
         if browser == "firefox":
-            command = [executable, "-no-remote", "-profile", profile, YOUTUBE_LOGIN_URL]
+            command = [
+                executable,
+                "-no-remote",
+                "-profile",
+                profile,
+                "-new-window",
+                YOUTUBE_LOGIN_URL,
+            ]
         else:
-            devtools_file = os.path.join(profile, "DevToolsActivePort")
-            try:
-                os.remove(devtools_file)
-            except OSError:
-                pass
             command = [
                 executable,
                 f"--user-data-dir={profile}",
@@ -505,16 +504,12 @@ class YtDownloaderApp(ctk.CTk):
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-background-mode",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0",
-                f"--app={YOUTUBE_LOGIN_URL}",
+                "--new-window",
+                YOUTUBE_LOGIN_URL,
             ]
         try:
-            if browser == "firefox":
-                login_succeeded = subprocess.call(command) == 0
-            else:
-                process = subprocess.Popen(command)
-                login_succeeded = wait_for_youtube_login(process, profile)
+            subprocess.Popen(command)
+            login_succeeded = wait_for_youtube_login(executable, previous_windows)
             if login_succeeded:
                 self.after(0, self.finish_youtube_login, browser, profile)
             else:

@@ -42,58 +42,42 @@ class ProxyDetectionTests(unittest.TestCase):
         app.handle_download_line("WARNING: SocksHTTPSConnection failed")
         self.assertTrue(app.proxy_error_detected)
 
-    def test_recognizes_only_the_youtube_login_callback(self):
-        valid = [{"url": "https://www.youtube.com/robots.txt", "id": "1"}]
-        lookalike = [{"url": "https://www.youtube.com.example/robots.txt", "id": "2"}]
-        self.assertEqual(yt_pro.find_completed_login_page(valid)["id"], "1")
-        self.assertIsNone(yt_pro.find_completed_login_page(lookalike))
+    def test_recognizes_only_completed_login_titles(self):
+        self.assertTrue(
+            yt_pro.is_completed_login_title("订阅 - YouTube - 个人 - Microsoft Edge")
+        )
+        self.assertTrue(yt_pro.is_completed_login_title("Subscriptions - YouTube"))
+        self.assertFalse(yt_pro.is_completed_login_title("登录 - Google 账号"))
+        self.assertFalse(yt_pro.is_completed_login_title("YouTube - 个人 - Microsoft Edge"))
 
-    def test_closes_browser_after_login_callback(self):
-        process = MagicMock()
-        process.poll.return_value = None
-        pages = [
-            {
-                "url": "https://www.youtube.com/robots.txt",
-                "id": "login-page",
-                "type": "page",
-            }
-        ]
+    def test_closes_new_browser_window_after_login(self):
+        user32 = yt_pro.ctypes.windll.user32
         with (
-            patch.object(yt_pro, "get_devtools_pages", return_value=(9222, pages)),
-            patch.object(yt_pro, "close_devtools_pages", return_value=True) as close,
-        ):
-            self.assertTrue(yt_pro.wait_for_youtube_login(process, "profile"))
-        close.assert_called_once_with(9222, pages)
-        process.wait.assert_called_once_with(timeout=10)
-
-    def test_waits_for_browser_after_edge_launcher_exits(self):
-        process = MagicMock()
-        process.poll.return_value = 0
-        login_page = [
-            {
-                "url": "https://accounts.google.com/ServiceLogin",
-                "id": "login-page",
-                "type": "page",
-            }
-        ]
-        completed_page = [
-            {
-                "url": "https://www.youtube.com/robots.txt",
-                "id": "login-page",
-                "type": "page",
-            }
-        ]
-        with (
+            patch.object(yt_pro, "get_browser_window_handles", return_value={1, 2}),
             patch.object(
                 yt_pro,
-                "get_devtools_pages",
-                side_effect=[(0, []), (9222, login_page), (9222, completed_page)],
+                "get_window_title",
+                return_value="订阅 - YouTube - 个人 - Microsoft Edge",
             ),
-            patch.object(yt_pro, "close_devtools_pages", return_value=True),
+            patch.object(user32, "IsWindow", side_effect=[True, False, False]),
+            patch.object(user32, "PostMessageW", return_value=True) as close,
             patch.object(yt_pro.time, "sleep"),
         ):
-            self.assertTrue(yt_pro.wait_for_youtube_login(process, "profile"))
-        process.poll.assert_not_called()
+            self.assertTrue(yt_pro.wait_for_youtube_login("msedge.exe", {1}))
+        close.assert_called_once_with(2, 0x0010, 0, 0)
+
+    def test_login_browser_uses_no_remote_debugging(self):
+        app = object.__new__(yt_pro.YtDownloaderApp)
+        app.after = MagicMock()
+        with (
+            patch.object(yt_pro, "get_browser_window_handles", return_value=set()),
+            patch.object(yt_pro.subprocess, "Popen") as launch,
+            patch.object(yt_pro, "wait_for_youtube_login", return_value=False),
+        ):
+            app.run_login_browser("edge", "msedge.exe", "profile")
+        command = launch.call_args.args[0]
+        self.assertIn("--new-window", command)
+        self.assertFalse(any("remote-debugging" in arg for arg in command))
 
 
 if __name__ == "__main__":

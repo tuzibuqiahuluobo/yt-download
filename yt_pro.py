@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.4.1"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90
@@ -167,8 +167,23 @@ def close_process_windows(process_id):
 
 
 def wait_for_youtube_login(process, profile):
-    while process.poll() is None:
+    startup_deadline = time.monotonic() + 15
+    browser_seen = False
+    disconnected_since = None
+
+    while True:
         port, pages = get_devtools_pages(profile)
+        now = time.monotonic()
+        if port:
+            browser_seen = True
+            disconnected_since = None
+        elif browser_seen:
+            disconnected_since = disconnected_since or now
+            if now - disconnected_since >= 3:
+                return False
+        elif now >= startup_deadline:
+            return False
+
         if find_completed_login_page(pages):
             close_devtools_pages(port, pages)
             try:
@@ -181,7 +196,6 @@ def wait_for_youtube_login(process, profile):
                     return False
             return True
         time.sleep(0.5)
-    return False
 
 
 def get_windows_proxy_url():

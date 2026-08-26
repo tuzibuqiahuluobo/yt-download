@@ -66,6 +66,35 @@ class ProxyDetectionTests(unittest.TestCase):
         close.assert_called_once_with(9222, pages)
         process.wait.assert_called_once_with(timeout=10)
 
+    def test_waits_for_browser_after_edge_launcher_exits(self):
+        process = MagicMock()
+        process.poll.return_value = 0
+        login_page = [
+            {
+                "url": "https://accounts.google.com/ServiceLogin",
+                "id": "login-page",
+                "type": "page",
+            }
+        ]
+        completed_page = [
+            {
+                "url": "https://www.youtube.com/robots.txt",
+                "id": "login-page",
+                "type": "page",
+            }
+        ]
+        with (
+            patch.object(
+                yt_pro,
+                "get_devtools_pages",
+                side_effect=[(0, []), (9222, login_page), (9222, completed_page)],
+            ),
+            patch.object(yt_pro, "close_devtools_pages", return_value=True),
+            patch.object(yt_pro.time, "sleep"),
+        ):
+            self.assertTrue(yt_pro.wait_for_youtube_login(process, "profile"))
+        process.poll.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

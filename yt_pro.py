@@ -1,22 +1,30 @@
 import ctypes
 import datetime as dt
 import glob
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
+import urllib.parse
 import urllib.request
+import winreg
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.4"
 APP_TITLE = f"YouTube Downloader {APP_VERSION}"
 YTDLP_EXE_NAME = "yt-dlp.exe"
 YTDLP_MAX_AGE_DAYS = 90
+YOUTUBE_LOGIN_URL = (
+    "https://accounts.google.com/ServiceLogin?service=youtube&continue="
+    "https%3A%2F%2Fwww.youtube.com%2Frobots.txt"
+)
 YTDLP_LATEST_RELEASE_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest"
 YTDLP_DOWNLOAD_URL = (
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
@@ -36,6 +44,182 @@ def configure_process_encoding():
 
 
 configure_process_encoding()
+
+
+def get_default_browser():
+    key_path = (
+        r"Software\Microsoft\Windows\Shell\Associations"
+        r"\UrlAssociations\https\UserChoice"
+    )
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
+    except OSError:
+        return ""
+
+    for marker, browser in (
+        ("chrome", "chrome"),
+        ("msedge", "edge"),
+        ("firefox", "firefox"),
+        ("brave", "brave"),
+    ):
+        if marker in prog_id:
+            return browser
+    return ""
+
+
+def get_browser_executable(browser):
+    executable_names = {
+        "chrome": "chrome.exe",
+        "edge": "msedge.exe",
+        "firefox": "firefox.exe",
+        "brave": "brave.exe",
+    }
+    executable_name = executable_names.get(browser, "")
+    if not executable_name:
+        return ""
+
+    found = shutil.which(executable_name)
+    if found:
+        return found
+
+    key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, key_path) as key:
+                path = winreg.QueryValue(key, None).strip('"')
+                if os.path.isfile(path):
+                    return path
+        except OSError:
+            pass
+    return ""
+
+
+def get_login_profile(browser):
+    base = os.environ.get("LOCALAPPDATA", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "YouTubeDownloader", f"{browser}-login")
+
+
+def get_cookie_args(cookie_source):
+    if cookie_source:
+        return ["--cookies-from-browser", cookie_source]
+    return []
+
+
+def get_devtools_pages(profile):
+    port_file = os.path.join(profile, "DevToolsActivePort")
+    try:
+        with open(port_file, encoding="utf-8") as file:
+            port = int(file.readline().strip())
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=1) as response:
+            return port, json.load(response)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0, []
+
+
+def find_completed_login_page(pages):
+    for page in pages:
+        url = urllib.parse.urlsplit(str(page.get("url", "")))
+        if (
+            url.scheme == "https"
+            and url.hostname in {"youtube.com", "www.youtube.com"}
+            and url.path == "/robots.txt"
+        ):
+            return page
+    return None
+
+
+def close_devtools_pages(port, pages):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    closed = False
+    for page in pages:
+        if page.get("type") != "page" or not page.get("id"):
+            continue
+        target_id = urllib.parse.quote(str(page["id"]), safe="")
+        try:
+            with opener.open(
+                f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=2
+            ):
+                closed = True
+        except OSError:
+            pass
+    return closed
+
+
+def close_process_windows(process_id):
+    wm_close = 0x0010
+    target_pid = ctypes.c_ulong()
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    @callback_type
+    def close_window(window_handle, _):
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            window_handle, ctypes.byref(target_pid)
+        )
+        if target_pid.value == process_id and ctypes.windll.user32.IsWindowVisible(
+            window_handle
+        ):
+            ctypes.windll.user32.PostMessageW(window_handle, wm_close, 0, 0)
+        return True
+
+    ctypes.windll.user32.EnumWindows(close_window, 0)
+
+
+def wait_for_youtube_login(process, profile):
+    while process.poll() is None:
+        port, pages = get_devtools_pages(profile)
+        if find_completed_login_page(pages):
+            close_devtools_pages(port, pages)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                close_process_windows(process.pid)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    return False
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def get_windows_proxy_url():
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            enabled = bool(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            proxy_server = str(winreg.QueryValueEx(key, "ProxyServer")[0]).strip()
+    except OSError:
+        return ""
+
+    if not enabled or not proxy_server:
+        return ""
+
+    scheme = "http"
+    value = proxy_server
+    if "=" in proxy_server:
+        proxies = {}
+        for item in proxy_server.split(";"):
+            if "=" in item:
+                kind, address = item.split("=", 1)
+                proxies[kind.strip().lower()] = address.strip()
+        value = ""
+        for kind in ("https", "http", "socks"):
+            if proxies.get(kind):
+                value = proxies[kind]
+                scheme = "socks5" if kind == "socks" else "http"
+                break
+
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"{scheme}://{value}"
+    return value
+
+
+def get_proxy_args():
+    return ["--proxy", get_windows_proxy_url()]
 
 # 全局美化设置
 ctk.set_appearance_mode("Dark")
@@ -61,8 +245,8 @@ class YtDownloaderApp(ctk.CTk):
             self.app_path = self.resource_path
 
         self.title(APP_TITLE)
-        self.geometry("840x690")
-        self.minsize(760, 620)
+        self.geometry("840x750")
+        self.minsize(760, 680)
 
         try:
             icon_path = os.path.join(self.resource_path, "my.ico")
@@ -75,6 +259,11 @@ class YtDownloaderApp(ctk.CTk):
         self.process = None
         self.is_user_stopping = False
         self.is_updating = False
+        self.auth_error_detected = False
+        self.cookie_lock_error_detected = False
+        self.proxy_error_detected = False
+        self.cookie_browser = ""
+        self.is_logging_in = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -129,6 +318,20 @@ class YtDownloaderApp(ctk.CTk):
             command=self.choose_save_path,
         )
         self.path_btn.pack(side="right", padx=(12, 0))
+
+        self.cookie_row = ctk.CTkFrame(self.input_card, fg_color="transparent")
+        self.cookie_row.pack(fill="x", padx=25, pady=(0, 20))
+
+        self.login_btn = ctk.CTkButton(
+            self.cookie_row,
+            text="登录 YouTube（年龄限制视频）",
+            width=220,
+            height=32,
+            fg_color="#3b8ed0",
+            hover_color="#36719f",
+            command=self.open_youtube_login,
+        )
+        self.login_btn.pack()
 
         self.control_card = ctk.CTkFrame(
             self, fg_color="#2b2b2b", corner_radius=12
@@ -241,6 +444,94 @@ class YtDownloaderApp(ctk.CTk):
             self.save_path = folder
             self.path_label.configure(text=f"存储位置: {folder}")
 
+    def open_youtube_login(self):
+        browser = get_default_browser()
+        executable = get_browser_executable(browser)
+        if not browser or not executable:
+            messagebox.showwarning(
+                "无法识别浏览器",
+                "请将 Chrome、Edge、Firefox 或 Brave 设置为 Windows 默认浏览器后重试。",
+            )
+            return
+
+        profile = get_login_profile(browser)
+        os.makedirs(profile, exist_ok=True)
+        self.cookie_browser = ""
+        self.is_logging_in = True
+        self.login_btn.configure(state="disabled", text="等待登录完成...")
+        auto_close_text = (
+            "登录成功后窗口会自动关闭，请勿提前关闭。"
+            if browser != "firefox"
+            else "Firefox 登录后请手动关闭窗口。"
+        )
+        messagebox.showinfo(
+            "YouTube 登录",
+            "即将打开一个独立的浏览器登录窗口。\n\n"
+            f"请完成 YouTube 登录和年龄验证。{auto_close_text}",
+        )
+        threading.Thread(
+            target=self.run_login_browser,
+            args=(browser, executable, profile),
+            daemon=True,
+        ).start()
+
+    def run_login_browser(self, browser, executable, profile):
+        if browser == "firefox":
+            command = [executable, "-no-remote", "-profile", profile, YOUTUBE_LOGIN_URL]
+        else:
+            devtools_file = os.path.join(profile, "DevToolsActivePort")
+            try:
+                os.remove(devtools_file)
+            except OSError:
+                pass
+            command = [
+                executable,
+                f"--user-data-dir={profile}",
+                "--profile-directory=Default",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-mode",
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
+                f"--app={YOUTUBE_LOGIN_URL}",
+            ]
+        try:
+            if browser == "firefox":
+                login_succeeded = subprocess.call(command) == 0
+            else:
+                process = subprocess.Popen(command)
+                login_succeeded = wait_for_youtube_login(process, profile)
+            if login_succeeded:
+                self.after(0, self.finish_youtube_login, browser, profile)
+            else:
+                self.after(
+                    0,
+                    self.fail_youtube_login,
+                    "未检测到登录成功。请重新登录，并等待浏览器自动关闭。",
+                )
+        except Exception as e:
+            self.after(0, self.fail_youtube_login, str(e))
+
+    def finish_youtube_login(self, browser, profile):
+        self.cookie_browser = f"{browser}:{profile}"
+        self.is_logging_in = False
+        self.login_btn.configure(
+            state="normal",
+            text="YouTube 已登录（重新登录）",
+            fg_color="#34C759",
+            hover_color="#30A84F",
+        )
+        self.log_write(">> 已确认登录成功并自动关闭浏览器，本地登录状态已启用。\n")
+        messagebox.showinfo(
+            "登录状态已启用",
+            "现在可以下载需要登录或年龄验证的视频。",
+        )
+
+    def fail_youtube_login(self, error_text):
+        self.is_logging_in = False
+        self.login_btn.configure(state="normal", text="登录 YouTube（年龄限制视频）")
+        messagebox.showerror("YouTube 登录失败", error_text)
+
     def start_task(self):
         url = self.url_entry.get().strip()
         if not url:
@@ -249,6 +540,12 @@ class YtDownloaderApp(ctk.CTk):
         if self.is_updating:
             messagebox.showinfo("正在更新", "yt-dlp 正在更新，请稍后再开始下载。")
             return
+        if self.is_logging_in:
+            messagebox.showinfo("正在登录", "请先完成登录并关闭独立浏览器窗口。")
+            return
+
+        cookie_args = get_cookie_args(self.cookie_browser)
+        proxy_args = get_proxy_args()
 
         outdated, version_text = self.is_yt_dlp_outdated()
         if outdated:
@@ -262,11 +559,25 @@ class YtDownloaderApp(ctk.CTk):
             return
 
         self.is_user_stopping = False
+        self.auth_error_detected = False
+        self.cookie_lock_error_detected = False
+        self.proxy_error_detected = False
         self.toggle_buttons("downloading")
+        self.progress_label.configure(text="STATUS: 正在连接...", text_color="#3498db")
         self.log_write(f">> 正在解析链接: {url}\n")
-        threading.Thread(target=self.run_yt_dlp, args=(url,), daemon=True).start()
+        if cookie_args:
+            self.log_write(">> 已启用本地登录凭据（不会上传 Cookie）。\n")
+        if proxy_args[1]:
+            self.log_write(">> 已自动读取当前 Windows 系统代理。\n")
+        else:
+            self.log_write(">> Windows 系统代理未启用，本次使用直连。\n")
+        threading.Thread(
+            target=self.run_yt_dlp,
+            args=(url, cookie_args, proxy_args),
+            daemon=True,
+        ).start()
 
-    def run_yt_dlp(self, url):
+    def run_yt_dlp(self, url, cookie_args, proxy_args):
         yt_dlp_exe = self.get_yt_dlp_path()
         if not os.path.exists(yt_dlp_exe):
             self.after(
@@ -290,6 +601,8 @@ class YtDownloaderApp(ctk.CTk):
             self.resource_path,
             "--newline",
             "--no-playlist",
+            *cookie_args,
+            *proxy_args,
             "-o",
             output_template,
             url,
@@ -336,11 +649,17 @@ class YtDownloaderApp(ctk.CTk):
             if not self.is_user_stopping:
                 if return_code == 0:
                     self.after(0, self.on_finish, "SUCCESS: 下载完成", "#2ecc71")
+                elif self.cookie_lock_error_detected:
+                    self.after(0, self.show_cookie_lock_error)
+                elif self.auth_error_detected:
+                    self.after(0, self.show_auth_error)
+                elif self.proxy_error_detected:
+                    self.after(0, self.show_proxy_error)
                 else:
                     self.after(
                         0,
                         self.on_finish,
-                        "ERROR: 任务异常中断，可尝试更新组件后重试",
+                        "ERROR: 下载失败，请查看日志",
                         "#e74c3c",
                     )
         except Exception as e:
@@ -354,6 +673,18 @@ class YtDownloaderApp(ctk.CTk):
             self.after(0, self.update_ui_progress, float(match.group(1)))
 
         lowered = line.lower()
+        if "cookie" in lowered and (
+            "failed to decrypt" in lowered or "could not copy" in lowered
+        ):
+            self.cookie_lock_error_detected = True
+        elif (
+            "sign in to confirm" in lowered
+            or "login required" in lowered
+            or "authentication" in lowered
+        ):
+            self.auth_error_detected = True
+        elif "proxyerror" in lowered or "sockshttp" in lowered:
+            self.proxy_error_detected = True
         if "older than 90 days" in lowered:
             self.after(0, self.log_write, ">> 组件已过期，任务已终止，请先更新组件。\n")
             return True
@@ -373,6 +704,30 @@ class YtDownloaderApp(ctk.CTk):
                 ">> 检测到组件可能过期，建议点击“更新组件”后重试。\n",
             )
         return False
+
+    def show_auth_error(self):
+        self.on_finish("ERROR: 需要登录验证", "#e74c3c")
+        messagebox.showwarning(
+            "需要登录验证",
+            "该视频需要已通过年龄验证的 YouTube 账号。\n\n"
+            "点击“登录 YouTube（年龄限制视频）”，在打开的浏览器中完成登录后重试。",
+        )
+
+    def show_cookie_lock_error(self):
+        self.on_finish("ERROR: 登录窗口尚未完全关闭", "#e74c3c")
+        messagebox.showwarning(
+            "登录窗口尚未关闭",
+            "浏览器仍在占用登录数据库。请关闭程序打开的独立登录窗口，"
+            "等待按钮显示“YouTube 已登录”后再下载。",
+        )
+
+    def show_proxy_error(self):
+        self.on_finish("ERROR: 当前代理不可用", "#e74c3c")
+        messagebox.showwarning(
+            "当前代理不可用",
+            "程序已自动读取最新的 Windows 系统代理，但该代理当前无法连接。\n\n"
+            "请启动代理程序或更新系统代理设置，然后点击“重试”；程序会重新读取。",
+        )
 
     def pause_task(self):
         self.is_user_stopping = True
